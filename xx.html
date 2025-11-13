@@ -572,5 +572,190 @@ const API_BASE = ''; // same-origin
 
 })();
 </script>
+
+<!-- BEGIN stego security patch: non-invasive enhancement -->
+<script id="__stego_security_patch">
+(function(){
+  'use strict';
+  // Small helper: append CSP meta if not present
+  try{
+    var hasCSP = !!document.querySelector('meta[http-equiv="Content-Security-Policy"]');
+    if(!hasCSP){
+      var meta = document.createElement('meta');
+      meta.httpEquiv = "Content-Security-Policy";
+      meta.content = "default-src 'self' https:; script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:;";
+      var head = document.head || document.getElementsByTagName('head')[0];
+      if(head) head.insertBefore(meta, head.firstChild);
+      console.info('[stego-patch] injected CSP meta');
+    }
+  }catch(e){ console.warn('[stego-patch] CSP injection failed', e); }
+
+  // Create a secure logger area if none
+  try{
+    if(!document.getElementById('stegoSecurityLog')){
+      var logEl = document.createElement('div');
+      logEl.id = 'stegoSecurityLog';
+      logEl.style.cssText = 'position:fixed;right:8px;bottom:8px;max-width:320px;max-height:200px;overflow:auto;background:#0f172a;color:#e6edf3;padding:8px;border-radius:8px;font-size:12px;z-index:99999;opacity:0.95';
+      logEl.innerText = 'Security log';
+      document.body.appendChild(logEl);
+    }
+  }catch(e){}
+
+  function sLog(msg){
+    try{
+      var el = document.getElementById('stegoSecurityLog');
+      if(el){ var d=document.createElement('div'); d.textContent = '['+new Date().toLocaleTimeString()+'] '+msg; el.appendChild(d); el.scrollTop = el.scrollHeight; }
+      console.info('[stego-patch] '+msg);
+    }catch(e){}
+  }
+
+  // Password strength enforcement: attach to buttons with id containing 'generate' or 'extract' or class 'secure-action'
+  function enforcePasswordStrength(password){
+    try{
+      if(window.zxcvbn){
+        var res = zxcvbn(password);
+        return res.score >= 3;
+      }
+      // fallback: require length >=12 and mix of char types
+      if(!password) return false;
+      if(password.length < 12) return false;
+      if(!(/[a-z]/.test(password) && /[A-Z]/.test(password) && /[0-9]/.test(password))) return false;
+      return true;
+    }catch(e){ return false; }
+  }
+
+  // Rate limiting state (in-memory)
+  var _failCounts = {}; // key -> count
+  function keyForAction(action){
+    try{ return action + '::' + (location.hostname || 'local'); }catch(e){ return action; }
+  }
+  function tooManyFails(action){
+    var k = keyForAction(action);
+    var c = _failCounts[k]||0;
+    return c >= 5;
+  }
+  function recordFail(action){
+    var k = keyForAction(action);
+    _failCounts[k] = (_failCounts[k]||0) + 1;
+  }
+  function resetFails(action){
+    var k = keyForAction(action);
+    delete _failCounts[k];
+  }
+
+  // Try to find common UI elements and wrap their click handlers non-destructively
+  function wrapButton(idCandidate, opts){
+    try{
+      var btn = document.getElementById(idCandidate);
+      if(!btn) return false;
+      if(btn.dataset.__stegoPatched) return true;
+      var orig = btn.onclick;
+      btn.dataset.__stegoPatched = '1';
+      btn.addEventListener('click', function(ev){
+        try{
+          // rate limit
+          if(tooManyFails(idCandidate)){ sLog('Action blocked due to repeated failures: '+idCandidate); ev.preventDefault(); ev.stopPropagation(); return; }
+          // if a password input exists nearby, enforce strength
+          var pw = document.querySelector('input[type="password"], input[id*="pass"], input[name*="pass"]');
+          if(opts && opts.enforcePassword && pw){
+            var ok = enforcePasswordStrength(pw.value);
+            if(!ok){ sLog('Passphrase rejected by policy for action '+idCandidate); alert('Passphrase too weak — use a stronger passphrase (min score)'); ev.preventDefault(); ev.stopPropagation(); recordFail(idCandidate); return; }
+          }
+          // allow original onclick to run, if present
+          if(typeof orig === 'function'){ try{ orig.call(btn, ev); }catch(e){ console.warn(e); } }
+        }catch(e){ console.error(e); }
+      }, {capture:true});
+      sLog('Patched button: '+idCandidate);
+      return true;
+    }catch(e){ return false; }
+  }
+
+  // Try to patch by id names commonly used
+  var candidates = ['generate','Generate','genBtn','btnGenerate','btn-generate','extract','btnExtract','download','dlBtn','btnDownload'];
+  candidates.forEach(function(id){
+    wrapButton(id, { enforcePassword:true });
+  });
+
+  // Also patch any element with data-secure attribute set to "true"
+  try{
+    Array.prototype.slice.call(document.querySelectorAll('[data-secure="true"]')).forEach(function(el){
+      if(el.tagName === 'BUTTON' || el.tagName === 'INPUT'){
+        wrapButton(el.id||('elem-'+Math.random().toString(36).slice(2)), { enforcePassword:true });
+      }
+    });
+  }catch(e){}
+
+  // Add SubtleCrypto helpers exposed as window.stegoSecure (non-destructive)
+  window.stegoSecure = (function(){
+    const enc = new TextEncoder(), dec = new TextDecoder();
+    async function deriveKeyRaw(password, salt, iterations){
+      iterations = iterations || 200000;
+      const base = await crypto.subtle.importKey('raw', enc.encode(password), {name:'PBKDF2'}, false, ['deriveKey','deriveBits']);
+      const key = await crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations, hash:'SHA-256'}, base, {name:'AES-GCM', length:256}, true, ['encrypt','decrypt']);
+      const raw = await crypto.subtle.exportKey('raw', key);
+      return { key, raw };
+    }
+    function abToB64(buf){ return btoa(String.fromCharCode.apply(null, new Uint8Array(buf))); }
+    function b64ToAb(b64){ const s = atob(b64); const a = new Uint8Array(s.length); for(var i=0;i<s.length;i++) a[i]=s.charCodeAt(i); return a.buffer; }
+    async function encryptJSON(obj, password){
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const dk = await deriveKeyRaw(password, salt.buffer);
+      const ct = await crypto.subtle.encrypt({name:'AES-GCM', iv}, dk.key, enc.encode(JSON.stringify(obj)));
+      return { ct_b64: abToB64(ct), iv_b64: abToB64(iv.buffer), salt_b64: abToB64(salt.buffer), rawKeyB64: abToB64(dk.raw) };
+    }
+    async function decryptJSON(ct_b64, iv_b64, salt_b64, password){
+      const ct = b64ToAb(ct_b64);
+      const iv = b64ToAb(iv_b64);
+      const salt = b64ToAb(salt_b64);
+      const dk = await deriveKeyRaw(password, salt);
+      const pt = await crypto.subtle.decrypt({name:'AES-GCM', iv:new Uint8Array(iv)}, dk.key, ct);
+      return JSON.parse(dec.decode(pt));
+    }
+    return { deriveKeyRaw, encryptJSON, decryptJSON, abToB64, b64ToAb };
+  })();
+
+  // Clipboard clear helper (best-effort)
+  async function clearClipboard(){
+    try{
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        await navigator.clipboard.writeText('');
+        sLog('Clipboard cleared (best-effort)');
+      }
+    }catch(e){ sLog('Clipboard clear failed'); }
+  }
+
+  // Intercept downloads to add small delay and clear clipboard afterwards
+  function patchDownloadAnchors(){
+    try{
+      var as = document.querySelectorAll('a[download]');
+      as.forEach(function(a){
+        if(a.dataset.__stegoDlPatched) return;
+        a.dataset.__stegoDlPatched = '1';
+        a.addEventListener('click', function(ev){
+          setTimeout(function(){ clearClipboard(); }, 1500);
+        });
+      });
+    }catch(e){}
+  }
+  // Initial patch and observer for dynamic anchors
+  patchDownloadAnchors();
+  var mo = new MutationObserver(function(){ patchDownloadAnchors(); });
+  mo.observe(document.body, { childList:true, subtree:true });
+
+  // Expose a function that generator code can call to validate password and perform encryption using SubtleCrypto in secure way.
+  // It does NOT change existing behavior unless caller uses it.
+  window.stegoSecurityHelpers = {
+    enforcePasswordStrength: enforcePasswordStrength,
+    wrapActionFailure: function(action){ recordFail(action); },
+    clearClipboard: clearClipboard,
+    sLog: sLog
+  };
+
+  sLog('Security patch active');
+})();
+</script>
+<!-- END stego security patch -->
+
 </body>
 </html>
